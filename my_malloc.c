@@ -6,35 +6,45 @@
 #include "my_malloc.h"
 #include <unistd.h>   // sbrk
 
+// Global error variable
 MyErrorNo my_errno = MYNOERROR;
 
-/* Only allowed global (besides my_errno) */
+/* Free list head. Only other global kept for the allocator
+* Free list always kept sorted by increasing address
+ */
 static FreeListNode g_free_list_head = (FreeListNode)0;
 
-
+/* Magic number stored in each allocated chunk header.
+* my_free checks this value for pointers not returned by my_malloc
+* Header is 8 bytes: [chunk_size | magic_number]*/
 static const uint32_t MY_MALLOC_MAGIC = 0xC0FFEE42u;
 
 
-
+// 8-byte chunk size alignment 
 static uint32_t align_up_8(uint32_t n)
 {
-    return (n + 7u) & ~7u;
+    return ((n + 7u) / 8u) * 8u;
 }
 
+// Helper
 static uint32_t max_u32(uint32_t a, uint32_t b)
 {
     return (a > b) ? a : b;
 }
 
+/*
+* min chunk size = max(16, sizeof(struct freelistnode))
+* Need enough room in a free chunk to store flink + size
+*/
 static uint32_t min_chunk_size(void)
 {
     
     return max_u32(16u, (uint32_t)sizeof(struct freelistnode));
 }
 
+/* total = header(8) + payload, rounded up to multiple of 8, at least min chunk */
 static uint32_t required_chunk_size(uint32_t payload_size)
 {
-    /* total = header(8) + payload, rounded up to multiple of 8, at least min chunk */
     uint32_t total = align_up_8(payload_size + 8u);
     uint32_t minsz = min_chunk_size();
     if (total < minsz) {
@@ -43,6 +53,10 @@ static uint32_t required_chunk_size(uint32_t payload_size)
     return total;
 }
 
+/* 8-byte header at start of chunk
+* hdr[0] = total chunk size (header + padding)
+* hdr[1] = magic number
+*/
 static void header_write(void *chunk_start, uint32_t chunk_size)
 {
     uint32_t *hdr = (uint32_t *)chunk_start;
@@ -100,7 +114,7 @@ static void free_list_insert_sorted(FreeListNode node)
     node->flink = curr;
 }
 
-/* Remove first-fit node with size >= needed; return it or 0 */
+/* Remove first free chunk in address order with size >= needed; return it or 0 */
 static FreeListNode free_list_remove_first_fit(uint32_t needed)
 {
     FreeListNode prev = (FreeListNode)0;
@@ -122,6 +136,14 @@ static FreeListNode free_list_remove_first_fit(uint32_t needed)
 }
 
 
+/* 
+* 1) compute required chunk size (header + payload + padding, min chunk size)
+* 2) try free chunk on free list
+* 3) if none, growth heap with sbrk()
+* 4) split chunk if remainder would be big enough for another free chunk
+* 5) write header, return pointer to payload
+
+*/
 void *my_malloc(uint32_t size)
 {
     uint32_t needed = required_chunk_size(size);
@@ -146,7 +168,7 @@ void *my_malloc(uint32_t size)
             chunk_size = avail;
         }
     } else {
-        /* 2) Grow heap via sbrk() */
+        /* grow heap via sbrk() */
         uint32_t incr = (needed > 8192u) ? needed : 8192u;
         incr = align_up_8(incr);
 
@@ -173,11 +195,12 @@ void *my_malloc(uint32_t size)
         }
     }
 
-    /* 3) Header + return  */
+    /* Header + return  */
     header_write((void *)chunk, chunk_size);
     my_errno = MYNOERROR;
     return chunk_to_payload((void *)chunk);
 }
+
 
 void my_free(void *ptr)
 {
@@ -201,15 +224,14 @@ void my_free(void *ptr)
 
     csize = header_read_size(chunk_start);
 
-    /* Overlay freelist node on freed chunk */
+    /* Turn freed chunk into a freelist node (store size + next) */
     node = (FreeListNode)chunk_start;
     node->size = csize;
     node->flink = (FreeListNode)0;
 
-    /* Insert sorted by address */
+    // Insert into free list in address order
     free_list_insert_sorted(node);
 
-    /* No coalescing*/
     my_errno = MYNOERROR;
 }
 
@@ -218,6 +240,10 @@ FreeListNode free_list_begin(void)
     return g_free_list_head;
 }
 
+/*  
+* Merge adjacent chunks in address order on the free list. 
+* Two chunks are adjacent if: (char *)curr + curr->size == (char *)next
+*/
 void coalesce_free_list(void)
 {
     FreeListNode curr = g_free_list_head;
